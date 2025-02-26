@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"mime/quotedprintable"
 	"os"
 	"strings"
 
@@ -14,8 +13,7 @@ import (
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message/mail"
 	"golang.org/x/net/html"
-	"golang.org/x/text/encoding/ianaindex"
-	"golang.org/x/text/transform"
+	"golang.org/x/text/encoding/charmap"
 )
 
 type Config struct {
@@ -148,19 +146,7 @@ func processMessage(msg *imap.Message) {
 			switch h := part.Header.(type) {
 			case *mail.InlineHeader:
 				contentType, params, _ := h.ContentType()
-				fmt.Printf("Tipo de conteúdo: %s\n", contentType)
-				fmt.Printf("Charset: %s\n", params["charset"])
-
 				body, _ := io.ReadAll(part.Body)
-
-				// Decodifica quoted-printable
-				if strings.ToLower(h.Get("Content-Transfer-Encoding")) == "quoted-printable" {
-					body, err = io.ReadAll(quotedprintable.NewReader(bytes.NewReader(body)))
-					if err != nil {
-						log.Printf("Erro ao decodificar quoted-printable: %v", err)
-						continue
-					}
-				}
 
 				body = convertCharset(body, params["charset"])
 
@@ -221,18 +207,17 @@ func convertCharset(input []byte, charset string) []byte {
 		return input
 	}
 
-	enc, err := ianaindex.IANA.Encoding(charset)
-	if err != nil {
-		log.Printf("Charset não suportado: %s", charset)
-		return input
+	charset = strings.ToLower(charset)
+
+	if charset == "iso-8859-1" || charset == "latin1" {
+		reader := charmap.ISO8859_1.NewDecoder().Reader(bytes.NewReader(input))
+		output, err := io.ReadAll(reader)
+		if err != nil {
+			log.Printf("Erro ao converter charset ISO-8859-1: %v", err)
+			return input
+		}
+		return output
 	}
 
-	reader := transform.NewReader(bytes.NewReader(input), enc.NewDecoder())
-	output, err := io.ReadAll(reader)
-	if err != nil {
-		log.Printf("Erro ao converter charset %s: %v", charset, err)
-		return input
-	}
-
-	return output
+	return input
 }
