@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,10 +10,14 @@ import (
 	"os"
 	"strings"
 
+	"mime/quotedprintable"
+
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"golang.org/x/net/html"
+	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
 )
 
@@ -22,6 +27,25 @@ type Config struct {
 	Senha    string `json:"senha"`
 	Porta    int    `json:"porta"`
 	IsSSL    bool   `json:"isSSL"`
+}
+
+func init() {
+	message.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		// Tenta tratar charset como ISO-8859-1 ou outros comuns
+		var decoder *encoding.Decoder
+
+		switch strings.ToLower(charset) {
+		case "iso-8859-1", "latin1":
+			decoder = charmap.ISO8859_1.NewDecoder()
+		case "windows-1252":
+			decoder = charmap.Windows1252.NewDecoder()
+		default:
+			// Tentando charset desconhecido com fallback para ISO-8859-1
+			decoder = charmap.ISO8859_1.NewDecoder()
+		}
+
+		return decoder.Reader(input), nil
+	}
 }
 
 func LoadConfig(filename string) (Config, error) {
@@ -146,9 +170,24 @@ func processMessage(msg *imap.Message) {
 			switch h := part.Header.(type) {
 			case *mail.InlineHeader:
 				contentType, params, _ := h.ContentType()
-				body, _ := io.ReadAll(part.Body)
+				transferEncoding := strings.ToLower(h.Header.Get("Content-Transfer-Encoding"))
+				charsetParam := strings.ToLower(strings.Trim(params["charset"], ` "`))
 
-				body = convertCharset(body, params["charset"])
+				var bodyReader io.Reader = part.Body
+				switch transferEncoding {
+				case "quoted-printable":
+					bodyReader = quotedprintable.NewReader(bodyReader)
+				case "base64":
+					bodyReader = base64.NewDecoder(base64.StdEncoding, bodyReader)
+				}
+
+				body, err := io.ReadAll(bodyReader)
+				if err != nil {
+					log.Printf("Erro ao ler corpo: %v", err)
+					continue
+				}
+
+				body = convertCharset(body, charsetParam)
 
 				switch {
 				case strings.Contains(contentType, "text/plain"):
@@ -202,22 +241,30 @@ func extractTextFromHTML(htmlBytes []byte) string {
 	return strings.TrimSpace(text)
 }
 
-func convertCharset(input []byte, charset string) []byte {
-	if charset == "" {
+func convertCharset(input []byte, charsetStr string) []byte {
+	if charsetStr == "" {
 		return input
 	}
 
-	charset = strings.ToLower(charset)
+	charsetStr = strings.ToLower(charsetStr)
 
-	if charset == "iso-8859-1" || charset == "latin1" {
-		reader := charmap.ISO8859_1.NewDecoder().Reader(bytes.NewReader(input))
-		output, err := io.ReadAll(reader)
-		if err != nil {
-			log.Printf("Erro ao converter charset ISO-8859-1: %v", err)
-			return input
-		}
-		return output
+	var decoder *encoding.Decoder
+
+	switch charsetStr {
+	case "iso-8859-1", "latin1":
+		decoder = charmap.ISO8859_1.NewDecoder()
+	case "windows-1252":
+		decoder = charmap.Windows1252.NewDecoder()
+	default:
+		// Charset desconhecido: tenta o fallback para ISO-8859-1
+		decoder = charmap.ISO8859_1.NewDecoder()
 	}
 
-	return input
+	reader := decoder.Reader(bytes.NewReader(input))
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		log.Printf("Erro na conversão de charset (%s): %v", charsetStr, err)
+		return input
+	}
+	return output
 }
