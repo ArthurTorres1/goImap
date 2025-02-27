@@ -30,10 +30,10 @@ type Config struct {
 }
 
 type EmailResponse struct {
-	Subject   string   `json:"subject"`
-	Date      string   `json:"date"`
-	Message   string   `json:"message"`
-	Attachments []string `json:"attachments"`
+	Titulo   string   `json:"subject"`
+	Data     string   `json:"date"`
+	Mensagem string   `json:"message"`
+	Arquivos []string `json:"attachments"`
 }
 
 func init() {
@@ -96,9 +96,37 @@ func processEmails(cfg Config) {
 	}
 	fmt.Println("Autenticado com sucesso.")
 
-	_, err = c.Select("INBOX", false)
+	// Processa a caixa de entrada (INBOX)
+	processFolder(c, "INBOX")
+
+	// Tenta processar a caixa de spam (SPAM), se existir
+	processFolder(c, "[Gmail]/Spam")
+}
+
+func listMailboxes(c *client.Client) {
+	ch := make(chan *imap.MailboxInfo, 10) // Canal para receber informações das pastas
+	err := c.List("", "*", ch)
 	if err != nil {
-		log.Printf("Erro ao selecionar INBOX: %v", err)
+		log.Printf("Erro ao listar pastas: %v", err)
+		return
+	}
+
+	fmt.Println("Pastas disponíveis:")
+	for mailbox := range ch {
+		fmt.Printf("Nome: %s\n", mailbox.Name)
+	}
+}
+
+
+func processFolder(c *client.Client, folder string) {
+	_, err := c.Select(folder, false)
+	if err != nil {
+		log.Printf("Erro ao selecionar %s: %v", folder, err)
+
+		// Tentando listar as pastas para garantir se existe "SPAM"
+		if folder == "[Gmail]/Spam" {
+			listMailboxes(c)
+		}
 		return
 	}
 
@@ -106,12 +134,12 @@ func processEmails(cfg Config) {
 	criteria.WithoutFlags = []string{imap.SeenFlag}
 	ids, err := c.Search(criteria)
 	if err != nil {
-		log.Printf("Erro ao buscar e-mails: %v", err)
+		log.Printf("Erro ao buscar e-mails em %s: %v", folder, err)
 		return
 	}
 
 	if len(ids) == 0 {
-		fmt.Println("Nenhum e-mail não lido encontrado.")
+		fmt.Printf("Nenhum e-mail não lido encontrado em %s.\n", folder)
 		return
 	}
 
@@ -123,7 +151,7 @@ func processEmails(cfg Config) {
 	go func() {
 		err := c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
 		if err != nil {
-			log.Printf("Erro ao buscar mensagens: %v", err)
+			log.Printf("Erro ao buscar mensagens em %s: %v", folder, err)
 		}
 	}()
 
@@ -148,7 +176,7 @@ func processEmails(cfg Config) {
 		if err := c.Store(markSeqSet, imap.AddFlags, flags, nil); err != nil {
 			log.Printf("Erro ao marcar e-mail como lido: %v", err)
 		} else {
-			fmt.Printf("E-mail %d marcado como lido.\n", msg.SeqNum)
+			fmt.Printf("E-mail %d de %s marcado como lido.\n", msg.SeqNum, folder)
 		}
 	}
 }
@@ -216,10 +244,10 @@ func processMessage(msg *imap.Message) EmailResponse {
 	}
 
 	return EmailResponse{
-		Subject:   msg.Envelope.Subject,
-		Date:      msg.Envelope.Date.String(),
-		Message:   mensagem,
-		Attachments: anexos,
+		Titulo:   msg.Envelope.Subject,
+		Data:     msg.Envelope.Date.String(),
+		Mensagem: mensagem,
+		Arquivos: anexos,
 	}
 }
 
