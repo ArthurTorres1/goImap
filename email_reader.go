@@ -29,9 +29,15 @@ type Config struct {
 	IsSSL    bool   `json:"isSSL"`
 }
 
+type EmailResponse struct {
+	Subject   string   `json:"subject"`
+	Date      string   `json:"date"`
+	Message   string   `json:"message"`
+	Attachments []string `json:"attachments"`
+}
+
 func init() {
 	message.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
-		// Tenta tratar charset como ISO-8859-1 ou outros comuns
 		var decoder *encoding.Decoder
 
 		switch strings.ToLower(charset) {
@@ -40,7 +46,6 @@ func init() {
 		case "windows-1252":
 			decoder = charmap.Windows1252.NewDecoder()
 		default:
-			// Tentando charset desconhecido com fallback para ISO-8859-1
 			decoder = charmap.ISO8859_1.NewDecoder()
 		}
 
@@ -123,8 +128,19 @@ func processEmails(cfg Config) {
 	}()
 
 	for msg := range messages {
-		processMessage(msg)
+		emailResponse := processMessage(msg)
 
+		// Convert the struct to JSON and print it
+		emailJson, err := json.Marshal(emailResponse)
+		if err != nil {
+			log.Printf("Erro ao gerar JSON: %v", err)
+			continue
+		}
+
+		// Print the JSON
+		fmt.Println(string(emailJson))
+
+		// Mark the message as read
 		markSeqSet := new(imap.SeqSet)
 		markSeqSet.AddNum(msg.SeqNum)
 
@@ -137,15 +153,11 @@ func processEmails(cfg Config) {
 	}
 }
 
-func processMessage(msg *imap.Message) {
+func processMessage(msg *imap.Message) EmailResponse {
 	if msg == nil || msg.Envelope == nil {
 		log.Println("Mensagem vazia ou sem envelope.")
-		return
+		return EmailResponse{}
 	}
-
-	fmt.Println("===================================")
-	fmt.Println("Título:", msg.Envelope.Subject)
-	fmt.Println("Data:", msg.Envelope.Date)
 
 	var mensagem string
 	var anexos []string
@@ -203,19 +215,11 @@ func processMessage(msg *imap.Message) {
 		}
 	}
 
-	if mensagem != "" {
-		fmt.Println("Mensagem:", mensagem)
-	} else {
-		fmt.Println("Mensagem: (Nenhum texto encontrado)")
-	}
-
-	if len(anexos) > 0 {
-		fmt.Println("Anexos encontrados:")
-		for _, anexo := range anexos {
-			fmt.Println("-", anexo)
-		}
-	} else {
-		fmt.Println("Nenhum anexo encontrado.")
+	return EmailResponse{
+		Subject:   msg.Envelope.Subject,
+		Date:      msg.Envelope.Date.String(),
+		Message:   mensagem,
+		Attachments: anexos,
 	}
 }
 
@@ -256,7 +260,6 @@ func convertCharset(input []byte, charsetStr string) []byte {
 	case "windows-1252":
 		decoder = charmap.Windows1252.NewDecoder()
 	default:
-		// Charset desconhecido: tenta o fallback para ISO-8859-1
 		decoder = charmap.ISO8859_1.NewDecoder()
 	}
 
