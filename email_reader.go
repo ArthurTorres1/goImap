@@ -1,22 +1,19 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
-
-	"mime/quotedprintable"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
-	"golang.org/x/net/html"
+
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
 )
@@ -30,16 +27,16 @@ type Config struct {
 }
 
 type EmailResponse struct {
-	Titulo   string   `json:"subject"`
-	Data     string   `json:"date"`
-	Mensagem string   `json:"message"`
-	Arquivos []string `json:"attachments"`
+	Titulo    string   `json:"subject"`
+	Data      string   `json:"date"`
+	Mensagem  string   `json:"message"`
+	Arquivos  []string `json:"attachments"`
+	LocalPath []string `json:"downloaded_files"`
 }
 
 func init() {
 	message.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
 		var decoder *encoding.Decoder
-
 		switch strings.ToLower(charset) {
 		case "iso-8859-1", "latin1":
 			decoder = charmap.ISO8859_1.NewDecoder()
@@ -48,7 +45,6 @@ func init() {
 		default:
 			decoder = charmap.ISO8859_1.NewDecoder()
 		}
-
 		return decoder.Reader(input), nil
 	}
 }
@@ -96,37 +92,14 @@ func processEmails(cfg Config) {
 	}
 	fmt.Println("Autenticado com sucesso.")
 
-	// Processa a caixa de entrada (INBOX)
 	processFolder(c, "INBOX")
-
-	// Tenta processar a caixa de spam (SPAM), se existir
 	processFolder(c, "[Gmail]/Spam")
 }
-
-func listMailboxes(c *client.Client) {
-	ch := make(chan *imap.MailboxInfo, 10) // Canal para receber informações das pastas
-	err := c.List("", "*", ch)
-	if err != nil {
-		log.Printf("Erro ao listar pastas: %v", err)
-		return
-	}
-
-	fmt.Println("Pastas disponíveis:")
-	for mailbox := range ch {
-		fmt.Printf("Nome: %s\n", mailbox.Name)
-	}
-}
-
 
 func processFolder(c *client.Client, folder string) {
 	_, err := c.Select(folder, false)
 	if err != nil {
 		log.Printf("Erro ao selecionar %s: %v", folder, err)
-
-		// Tentando listar as pastas para garantir se existe "SPAM"
-		if folder == "[Gmail]/Spam" {
-			listMailboxes(c)
-		}
 		return
 	}
 
@@ -147,7 +120,6 @@ func processFolder(c *client.Client, folder string) {
 	seqset.AddNum(ids...)
 
 	messages := make(chan *imap.Message, len(ids))
-
 	go func() {
 		err := c.Fetch(seqset, []imap.FetchItem{imap.FetchEnvelope, imap.FetchRFC822}, messages)
 		if err != nil {
@@ -158,20 +130,18 @@ func processFolder(c *client.Client, folder string) {
 	for msg := range messages {
 		emailResponse := processMessage(msg)
 
-		// Convert the struct to JSON and print it
+		// Convertendo para JSON
 		emailJson, err := json.Marshal(emailResponse)
 		if err != nil {
 			log.Printf("Erro ao gerar JSON: %v", err)
 			continue
 		}
 
-		// Print the JSON
 		fmt.Println(string(emailJson))
 
-		// Mark the message as read
+		// Marcar como lido
 		markSeqSet := new(imap.SeqSet)
 		markSeqSet.AddNum(msg.SeqNum)
-
 		flags := []interface{}{imap.SeenFlag}
 		if err := c.Store(markSeqSet, imap.AddFlags, flags, nil); err != nil {
 			log.Printf("Erro ao marcar e-mail como lido: %v", err)
@@ -189,6 +159,7 @@ func processMessage(msg *imap.Message) EmailResponse {
 
 	var mensagem string
 	var anexos []string
+	var localPaths []string
 
 	for section, literal := range msg.Body {
 		reader, err := mail.CreateReader(literal)
@@ -209,93 +180,53 @@ func processMessage(msg *imap.Message) EmailResponse {
 
 			switch h := part.Header.(type) {
 			case *mail.InlineHeader:
-				contentType, params, _ := h.ContentType()
-				transferEncoding := strings.ToLower(h.Header.Get("Content-Transfer-Encoding"))
-				charsetParam := strings.ToLower(strings.Trim(params["charset"], ` "`))
-
-				var bodyReader io.Reader = part.Body
-				switch transferEncoding {
-				case "quoted-printable":
-					bodyReader = quotedprintable.NewReader(bodyReader)
-				case "base64":
-					bodyReader = base64.NewDecoder(base64.StdEncoding, bodyReader)
-				}
-
-				body, err := io.ReadAll(bodyReader)
-				if err != nil {
-					log.Printf("Erro ao ler corpo: %v", err)
-					continue
-				}
-
-				body = convertCharset(body, charsetParam)
-
-				switch {
-				case strings.Contains(contentType, "text/plain"):
-					mensagem = strings.TrimSpace(string(body))
-				case strings.Contains(contentType, "text/html") && mensagem == "":
-					mensagem = extractTextFromHTML(body)
-				}
+				body, _ := io.ReadAll(part.Body)
+				mensagem = string(body)
 
 			case *mail.AttachmentHeader:
 				filename, _ := h.Filename()
 				anexos = append(anexos, filename)
+
+				// Salvar arquivo
+				filePath := saveAttachment(part.Body, filename)
+				if filePath != "" {
+					localPaths = append(localPaths, filePath)
+				}
 			}
 		}
 	}
 
 	return EmailResponse{
-		Titulo:   msg.Envelope.Subject,
-		Data:     msg.Envelope.Date.String(),
-		Mensagem: mensagem,
-		Arquivos: anexos,
+		Titulo:    msg.Envelope.Subject,
+		Data:      msg.Envelope.Date.String(),
+		Mensagem:  mensagem,
+		Arquivos:  anexos,
+		LocalPath: localPaths,
 	}
 }
 
-func extractTextFromHTML(htmlBytes []byte) string {
-	doc, err := html.Parse(bytes.NewReader(htmlBytes))
+func saveAttachment(body io.Reader, filename string) string {
+	// Criar diretório downloads se não existir
+	downloadDir := "downloads"
+	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
+		os.Mkdir(downloadDir, 0755)
+	}
+
+	// Caminho completo do arquivo
+	filePath := filepath.Join(downloadDir, filename)
+	outFile, err := os.Create(filePath)
 	if err != nil {
-		log.Printf("Erro ao analisar HTML: %v", err)
+		log.Printf("Erro ao criar arquivo %s: %v", filePath, err)
+		return ""
+	}
+	defer outFile.Close()
+
+	_, err = io.Copy(outFile, body)
+	if err != nil {
+		log.Printf("Erro ao salvar anexo %s: %v", filePath, err)
 		return ""
 	}
 
-	var text string
-	var f func(*html.Node)
-	f = func(n *html.Node) {
-		if n.Type == html.TextNode {
-			text += n.Data
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			f(c)
-		}
-	}
-	f(doc)
-
-	return strings.TrimSpace(text)
-}
-
-func convertCharset(input []byte, charsetStr string) []byte {
-	if charsetStr == "" {
-		return input
-	}
-
-	charsetStr = strings.ToLower(charsetStr)
-
-	var decoder *encoding.Decoder
-
-	switch charsetStr {
-	case "iso-8859-1", "latin1":
-		decoder = charmap.ISO8859_1.NewDecoder()
-	case "windows-1252":
-		decoder = charmap.Windows1252.NewDecoder()
-	default:
-		decoder = charmap.ISO8859_1.NewDecoder()
-	}
-
-	reader := decoder.Reader(bytes.NewReader(input))
-	output, err := io.ReadAll(reader)
-	if err != nil {
-		log.Printf("Erro na conversão de charset (%s): %v", charsetStr, err)
-		return input
-	}
-	return output
+	fmt.Printf("Anexo salvo: %s\n", filePath)
+	return filePath
 }
