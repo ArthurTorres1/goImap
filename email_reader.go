@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"path/filepath"
 	"strings"
 
@@ -181,7 +182,8 @@ func processMessage(msg *imap.Message) EmailResponse {
 			switch h := part.Header.(type) {
 			case *mail.InlineHeader:
 				body, _ := io.ReadAll(part.Body)
-				mensagem = string(body)
+				// Remover quebras de linha e tags HTML
+				mensagem = cleanHTML(string(body))
 
 			case *mail.AttachmentHeader:
 				filename, _ := h.Filename()
@@ -230,3 +232,30 @@ func saveAttachment(body io.Reader, filename string) string {
 	fmt.Printf("Anexo salvo: %s\n", filePath)
 	return filePath
 }
+
+// cleanHTML remove todas as tags HTML e formata a mensagem
+func cleanHTML(html string) string {
+	// Remove todas as tags HTML
+	re := regexp.MustCompile("<.*?>")
+	cleaned := re.ReplaceAllString(html, "")
+
+	// Substitui entidades HTML comuns
+	replacer := strings.NewReplacer(
+		"&nbsp;", " ",
+		"&amp;", "&",
+		"&lt;", "<",
+		"&gt;", ">",
+		"&quot;", `"`,
+		"&#39;", "'",
+		"\n", " ", // Remove quebras de linha desnecessárias
+		"\r", " ",
+	)
+
+	cleaned = replacer.Replace(cleaned)
+
+	// Remove espaços em excesso
+	cleaned = strings.TrimSpace(cleaned)
+
+	return cleaned
+}
+
