@@ -6,8 +6,8 @@ import (
 	"io"
 	"log"
 	"os"
-	"regexp"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/emersion/go-imap"
@@ -17,6 +17,8 @@ import (
 
 	"golang.org/x/text/encoding"
 	"golang.org/x/text/encoding/charmap"
+	"gorm.io/driver/sqlserver"
+	"gorm.io/gorm"
 )
 
 type Config struct {
@@ -25,15 +27,45 @@ type Config struct {
 	Senha    string `json:"senha"`
 	Porta    int    `json:"porta"`
 	IsSSL    bool   `json:"isSSL"`
+	Database struct {
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		User     string `json:"user"`
+		Password string `json:"password"`
+		DbName   string `json:"dbname"`
+	} `json:"database"`
 }
 
 type EmailResponse struct {
-	Titulo    string   `json:"subject"`
-	Data      string   `json:"date"`
-	Mensagem  string   `json:"message"`
-	Arquivos  []string `json:"attachments"`
-	LocalPath []string `json:"downloaded_files"`
+	Titulo   string   `json:"subject"`
+	Data     string   `json:"date"`
+	Mensagem string   `json:"message"`
+	Arquivos []string `json:"attachments"`
 }
+
+type EmailRecebido struct {
+	Codigo   int64  `gorm:"primaryKey;autoIncrement:true"`
+	Data     string `gorm:"type:datetime"`
+	Titulo   string `gorm:"type:varchar(255)"`
+	Mensagem string `gorm:"type:varchar(255)"`
+}
+
+func (EmailRecebido) TableName() string {
+	return "tabEmailRecebidos" // Nome correto da tabela no banco
+}
+
+type EmailAnexo struct {
+	Codigo              int64  `gorm:"primaryKey;autoIncrement:true;column:codigo"`
+	EmailRecebidoCodigo int64  `gorm:"not null;column:emailRecebidosCodigo"`
+	NomeArquivo         string `gorm:"type:varchar(255);column:nomeArquivo"`
+	IsLido              bool   `gorm:"type:bit;column:isLido"`
+}
+
+func (EmailAnexo) TableName() string {
+	return "tabEmailRecebidosAnexos" // Nome da tabela que você já tem no banco
+}
+
+var db *gorm.DB
 
 func init() {
 	message.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
@@ -73,9 +105,16 @@ func main() {
 		log.Fatalf("Erro ao carregar configuração: %v", err)
 	}
 
-	fmt.Println("Configuração carregada com sucesso:")
-	fmt.Printf("Servidor: %s\nEmail: %s\nPorta: %d\nSSL: %v\n", config.Servidor, config.Email, config.Porta, config.IsSSL)
+	// Conectar ao banco de dados SQL Server usando GORM
+	dsn := fmt.Sprintf("sqlserver://%s:%s@%s:%d?database=%s", config.Database.User, config.Database.Password, config.Database.Host, config.Database.Port, config.Database.DbName)
+	db, err = gorm.Open(sqlserver.Open(dsn), &gorm.Config{})
+	if err != nil {
+		log.Fatalf("Erro ao conectar ao banco de dados: %v", err)
+	}
 
+	fmt.Println("Conexão com o banco de dados estabelecida com sucesso.")
+
+	// Processar os e-mails
 	processEmails(config)
 }
 
@@ -131,16 +170,35 @@ func processFolder(c *client.Client, folder string) {
 	for msg := range messages {
 		emailResponse := processMessage(msg)
 
-		// Convertendo para JSON
-		emailJson, err := json.Marshal(emailResponse)
-		if err != nil {
-			log.Printf("Erro ao gerar JSON: %v", err)
-			continue
+		// Salvar email na tabela tabEmailRecebidos
+		email := EmailRecebido{
+			Data:     msg.Envelope.Date.Format("2006-01-02 15:04:05"),
+			Titulo:   emailResponse.Titulo,
+			Mensagem: emailResponse.Mensagem,
+		}
+		result := db.Create(&email)
+		if result.Error != nil {
+			log.Printf("Erro ao salvar e-mail na tabela tabEmailRecebidos: %v", result.Error)
+		} else {
+			fmt.Printf("E-mail salvo na tabela tabEmailRecebidos: %v\n", email.Titulo)
 		}
 
-		fmt.Println(string(emailJson))
+		// Salvar anexos na tabela tabEmailRecebidosAnexos
+		for _, anexo := range emailResponse.Arquivos {
+			emailAnexo := EmailAnexo{
+				EmailRecebidoCodigo: email.Codigo, // O código é gerado automaticamente
+				NomeArquivo:         anexo,
+				IsLido:              false, // Definir como não lido inicialmente
+			}
+			result := db.Create(&emailAnexo)
+			if result.Error != nil {
+				log.Printf("Erro ao salvar anexo na tabela tabEmailRecebidosAnexos: %v", result.Error)
+			} else {
+				fmt.Printf("Anexo salvo na tabela tabEmailRecebidosAnexos: %v\n", anexo)
+			}
+		}
 
-		// Marcar como lido
+		// Marcar e-mail como lido
 		markSeqSet := new(imap.SeqSet)
 		markSeqSet.AddNum(msg.SeqNum)
 		flags := []interface{}{imap.SeenFlag}
@@ -160,7 +218,6 @@ func processMessage(msg *imap.Message) EmailResponse {
 
 	var mensagem string
 	var anexos []string
-	var localPaths []string
 
 	for section, literal := range msg.Body {
 		reader, err := mail.CreateReader(literal)
@@ -188,22 +245,16 @@ func processMessage(msg *imap.Message) EmailResponse {
 			case *mail.AttachmentHeader:
 				filename, _ := h.Filename()
 				anexos = append(anexos, filename)
-
-				// Salvar arquivo
-				filePath := saveAttachment(part.Body, filename)
-				if filePath != "" {
-					localPaths = append(localPaths, filePath)
-				}
+				saveAttachment(part.Body, filename)
 			}
 		}
 	}
 
 	return EmailResponse{
-		Titulo:    msg.Envelope.Subject,
-		Data:      msg.Envelope.Date.String(),
-		Mensagem:  mensagem,
-		Arquivos:  anexos,
-		LocalPath: localPaths,
+		Titulo:   msg.Envelope.Subject,
+		Data:     msg.Envelope.Date.String(),
+		Mensagem: mensagem,
+		Arquivos: anexos,
 	}
 }
 
@@ -211,51 +262,33 @@ func saveAttachment(body io.Reader, filename string) string {
 	// Criar diretório downloads se não existir
 	downloadDir := "downloads"
 	if _, err := os.Stat(downloadDir); os.IsNotExist(err) {
-		os.Mkdir(downloadDir, 0755)
+		err := os.Mkdir(downloadDir, 0755)
+		if err != nil {
+			log.Printf("Erro ao criar diretório para anexos: %v", err)
+			return ""
+		}
 	}
 
-	// Caminho completo do arquivo
+	// Salvar anexo no diretório
 	filePath := filepath.Join(downloadDir, filename)
 	outFile, err := os.Create(filePath)
 	if err != nil {
-		log.Printf("Erro ao criar arquivo %s: %v", filePath, err)
+		log.Printf("Erro ao salvar anexo %s: %v", filename, err)
 		return ""
 	}
 	defer outFile.Close()
 
 	_, err = io.Copy(outFile, body)
 	if err != nil {
-		log.Printf("Erro ao salvar anexo %s: %v", filePath, err)
+		log.Printf("Erro ao copiar conteúdo do anexo %s: %v", filename, err)
 		return ""
 	}
 
-	fmt.Printf("Anexo salvo: %s\n", filePath)
 	return filePath
 }
 
-// cleanHTML remove todas as tags HTML e formata a mensagem
-func cleanHTML(html string) string {
-	// Remove todas as tags HTML
-	re := regexp.MustCompile("<.*?>")
-	cleaned := re.ReplaceAllString(html, "")
-
-	// Substitui entidades HTML comuns
-	replacer := strings.NewReplacer(
-		"&nbsp;", " ",
-		"&amp;", "&",
-		"&lt;", "<",
-		"&gt;", ">",
-		"&quot;", `"`,
-		"&#39;", "'",
-		"\n", " ", // Remove quebras de linha desnecessárias
-		"\r", " ",
-	)
-
-	cleaned = replacer.Replace(cleaned)
-
-	// Remove espaços em excesso
-	cleaned = strings.TrimSpace(cleaned)
-
-	return cleaned
+func cleanHTML(input string) string {
+	// Limpar HTML (pode ser ajustado conforme necessário)
+	re := regexp.MustCompile(`<.*?>`)
+	return re.ReplaceAllString(input, "")
 }
-

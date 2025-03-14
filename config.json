@@ -3,5 +3,12 @@
     "email": "edi.robopostall@gmail.com",
     "senha": "oasj svvx vpqn xtzl",
     "porta": 993,
-    "isSSL": true
+    "isSSL": true,
+    "database": {
+        "host": "52.71.124.11",
+        "port": 49383,
+        "user": "sistemaTeste",
+        "password": "T&$t&JPAblas@420",
+        "dbname": "postall"
+    }
 }
